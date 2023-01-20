@@ -17,6 +17,7 @@
 */
 #![doc(html_logo_url = "https://gif.ski/icon.png")]
 
+use executor::{execute_a_bunch, BoxFuture};
 use imagequant::{Image, QuantizationResult, Attributes};
 use imgref::*;
 use rgb::*;
@@ -32,6 +33,8 @@ mod denoise;
 use crate::denoise::*;
 mod encoderust;
 
+mod executor;
+
 #[cfg(feature = "gifsicle")]
 mod encodegifsicle;
 
@@ -41,12 +44,8 @@ mod minipool;
 #[cfg(feature = "binary")]
 #[doc(hidden)]
 pub use minipool::new_channel as private_minipool;
-
-use crossbeam_channel::{Receiver, Sender};
+use async_channel::{Receiver, Sender};
 use std::io::prelude::*;
-use std::num::NonZeroU8;
-use std::thread;
-use std::sync::atomic::Ordering::Relaxed;
 
 struct InputFrameUnresized {
     /// The pixels to resize and encode
@@ -87,7 +86,6 @@ pub struct Settings {
 #[non_exhaustive]
 struct SettingsExt {
     pub s: Settings,
-    pub max_threads: NonZeroU8,
     pub extra_effort: bool,
     pub motion_quality: u8,
     pub giflossy_quality: u8,
@@ -165,6 +163,19 @@ struct DiffMessage {
     importance_map: Vec<u8>,
 }
 
+struct QuantizeMessage {
+    /// 1.. with holes
+    ordinal_frame_number: usize,
+    /// 0.. no holes
+    frame_index: u32,
+    needs_transparency: bool,
+    image: ImgVec<RGBA8>,
+    importance_map: Vec<u8>,
+    prev_frame_keeps: bool,
+    dispose: gif::DisposalMethod,
+    end_pts: f64,
+}
+
 /// Frame post quantization, before remap
 struct RemapMessage {
     /// 1..
@@ -199,7 +210,7 @@ pub fn new(settings: Settings) -> CatResult<(Collector, Writer)> {
     if settings.width.unwrap_or(0) > 1<<16 || settings.height.unwrap_or(0) > 1<<16 {
         return Err(Error::WrongSize("image size too large".into()));
     }
-    let (queue, queue_iter) = crossbeam_channel::bounded(6); // should be sufficient for denoiser lookahead
+    let (queue, queue_iter) = async_channel::bounded(6); // should be sufficient for denoiser lookahead
 
     Ok((
         Collector {
@@ -208,7 +219,6 @@ pub fn new(settings: Settings) -> CatResult<(Collector, Writer)> {
         Writer {
             queue_iter: Some(queue_iter),
             settings: SettingsExt {
-                max_threads: thread::available_parallelism().map(|t| t.get().min(255) as u8).unwrap_or(8).try_into().unwrap(),
                 motion_quality: settings.quality,
                 giflossy_quality: settings.quality,
                 extra_effort: false,
@@ -228,7 +238,7 @@ impl Collector {
     /// If the first frame doesn't start at pts=0, the delay will be used for the last frame.
     pub fn add_frame_rgba(&self, frame_index: usize, frame: ImgVec<RGBA8>, presentation_timestamp: f64) -> CatResult<()> {
         debug_assert!(frame_index == 0 || presentation_timestamp > 0.);
-        self.queue.send(Ok(InputFrameUnresized {
+        self.queue.send_blocking(Ok(InputFrameUnresized {
             frame_index,
             frame,
             presentation_timestamp,
@@ -249,7 +259,7 @@ impl Collector {
             .map_err(|err| Error::PNG(format!("Can't load {}: {err}", path.display())))?;
 
         let frame = Img::new(image.buffer, image.width, image.height);
-        self.queue.send(Ok(InputFrameUnresized {
+        self.queue.send_blocking(Ok(InputFrameUnresized {
             frame,
             presentation_timestamp,
             frame_index,
@@ -392,7 +402,7 @@ impl Writer {
     ///
     /// `background` is the previous frame.
     fn quantize(image: ImgVec<RGBA8>, importance_map: &[u8], first_frame: bool, needs_transparency: bool, prev_frame_keeps: bool, settings: &SettingsExt) -> CatResult<(Attributes, QuantizationResult, Image<'static>)> {
-        let SettingsExt {s: settings, extra_effort, motion_quality: _, giflossy_quality: _, max_threads: _ } = settings;
+        let SettingsExt {s: settings, extra_effort, motion_quality: _, giflossy_quality: _, } = settings;
         let mut liq = Attributes::new();
         if settings.fast {
             liq.set_speed(10)?;
@@ -439,7 +449,7 @@ impl Writer {
         let mut pts_in_delay_units = 0_u64;
 
         let mut n_done = 0;
-        for FrameMessage {frame, ordinal_frame_number, end_pts, ..} in write_queue {
+        while let Ok(FrameMessage {frame, ordinal_frame_number, end_pts, ..}) = write_queue.recv_blocking() {
             let delay = ((end_pts * 100.0).round() as u64)
                 .saturating_sub(pts_in_delay_units)
                 .min(30000) as u16;
@@ -490,54 +500,52 @@ impl Writer {
 
         let settings_ext = self.settings;
         let settings = self.settings.s;
-        let (diff_queue, diff_queue_recv) = ordqueue::new(2);
-        let resize_thread = thread::Builder::new().name("resize".into()).spawn(move || {
-            Self::make_resize(decode_queue_recv, diff_queue, &settings_ext)
-        })?;
-        let (quant_queue, quant_queue_recv) = crossbeam_channel::bounded(2);
-        let diff_thread = thread::Builder::new().name("diff".into()).spawn(move || {
-            Self::make_diffs(diff_queue_recv, quant_queue, &settings_ext)
-        })?;
-        let (remap_queue, remap_queue_recv) = ordqueue::new(2);
-        let quant_thread = thread::Builder::new().name("quant".into()).spawn(move || {
-            Self::quantize_frames(quant_queue_recv, remap_queue, &settings_ext)
-        })?;
-        let (write_queue, write_queue_recv) = crossbeam_channel::bounded(2);
-        let remap_thread = thread::Builder::new().name("remap".into()).spawn(move || {
-            Self::remap_frames(remap_queue_recv, write_queue, &settings)
-        })?;
-        let res0 = Self::write_frames(write_queue_recv, encoder, &self.settings.s, reporter);
-        let res1 = resize_thread.join().map_err(|_| Error::ThreadSend)?;
-        let res2 = diff_thread.join().map_err(|_| Error::ThreadSend)?;
-        let res3 = quant_thread.join().map_err(|_| Error::ThreadSend)?;
-        let res4 = remap_thread.join().map_err(|_| Error::ThreadSend)?;
-        combine_res(combine_res(combine_res(res0, res1), combine_res(res2, res3)), res4)
-    }
+        let (diff_queue, diff_queue_recv) = ordqueue::new(1);
+        let (select_queue, select_queue_recv) = async_channel::bounded(1);
+        let (quant_queue, quant_queue_recv) = async_channel::bounded(1);
+        let (remap_queue, remap_queue_recv) = ordqueue::new(1);
+        let (write_queue, write_queue_recv) = async_channel::bounded(1);
 
-    fn make_resize(inputs: Receiver<CatResult<InputFrameUnresized>>, diff_queue: OrdQueue<InputFrame>, settings: &SettingsExt) -> CatResult<()> {
-        minipool::new_scope(settings.max_threads.min(if settings.s.fast || settings.extra_effort { 6 } else { 4 }.try_into().unwrap()), "resize", move || {
-            Ok(())
-        }, move |abort| {
-            for frame in inputs {
-                if abort.load(Relaxed) {
-                    return Err(Error::Aborted);
-                }
-                let frame = frame?;
-                let resized = resized_binary_alpha(frame.frame, settings.s.width, settings.s.height)?;
-                let frame_blurred = if settings.extra_effort { smart_blur(resized.as_ref()) } else { less_smart_blur(resized.as_ref()) };
-                diff_queue.push(frame.frame_index, InputFrame {
-                    frame: resized,
-                    frame_blurred,
-                    presentation_timestamp: frame.presentation_timestamp,
-                })?;
-            }
-            Ok(())
+        std::thread::scope(|s| {
+            let handle = std::thread::Builder::new().spawn_scoped(s, move || {
+                execute_a_bunch([
+                    Box::new(Self::make_resize_par(decode_queue_recv.clone(), diff_queue.clone(), &settings_ext)) as BoxFuture<_>,
+                    Box::new(Self::make_resize_par(decode_queue_recv.clone(), diff_queue.clone(), &settings_ext)),
+                    Box::new(Self::make_resize_par(decode_queue_recv, diff_queue, &settings_ext)),
+
+                    Box::new(Self::make_diffs(diff_queue_recv, select_queue, &settings_ext)),
+                    Box::new(Self::select_disposal(select_queue_recv, quant_queue, &settings_ext)),
+
+                    Box::new(Self::quantize_frames_par(quant_queue_recv.clone(), remap_queue.clone(), &settings_ext)),
+                    Box::new(Self::quantize_frames_par(quant_queue_recv.clone(), remap_queue.clone(), &settings_ext)),
+                    Box::new(Self::quantize_frames_par(quant_queue_recv, remap_queue, &settings_ext)),
+
+                    Box::new(Self::remap_frames(remap_queue_recv, write_queue, &settings)),
+                ])
+            })?;
+            Self::write_frames(write_queue_recv, encoder, &self.settings.s, reporter)?;
+            handle.join().map_err(|_| Error::ThreadSend)?
         })
     }
 
-    fn make_diffs(inputs: OrdQueueIter<InputFrame>, quant_queue: Sender<DiffMessage>, settings: &SettingsExt) -> CatResult<()> {
-        let mut inputs = inputs.into_iter();
-        let first_frame = inputs.next().ok_or(Error::NoFrames)?;
+    /// Apply resizing and crate a blurred version for the diff/denoise phase
+    async fn make_resize_par(inputs: Receiver<CatResult<InputFrameUnresized>>, diff_queue: OrdQueue<InputFrame>, settings: &SettingsExt) -> CatResult<()> {
+        while let Ok(frame) = inputs.recv().await {
+            let frame = frame?;
+            let resized = resized_binary_alpha(frame.frame, settings.s.width, settings.s.height)?;
+            let frame_blurred = if settings.extra_effort { smart_blur(resized.as_ref()) } else { less_smart_blur(resized.as_ref()) };
+            diff_queue.push(frame.frame_index, InputFrame {
+                frame: resized,
+                frame_blurred,
+                presentation_timestamp: frame.presentation_timestamp,
+            }).await?;
+        }
+        Ok(())
+    }
+
+    /// Find differences between frames, and compute importance maps
+    async fn make_diffs(mut inputs: OrdQueueIter<InputFrame>, diffs: Sender<DiffMessage>, settings: &SettingsExt) -> CatResult<()> {
+        let first_frame = inputs.next().await.ok_or(Error::NoFrames)?;
 
         let mut last_frame_duration = if first_frame.presentation_timestamp > 1. / 100. {
             // this is gifski's weird rule that a non-zero first-frame pts
@@ -563,7 +571,7 @@ impl Writer {
             ////////////////////// Feed denoiser: /////////////////////
 
             let curr_frame = next_frame.take();
-            next_frame = inputs.next();
+            next_frame = inputs.next().await;
 
             if let Some(InputFrame { frame, frame_blurred, presentation_timestamp: raw_pts }) = curr_frame {
                 ordinal_frame_number += 1;
@@ -595,34 +603,33 @@ impl Writer {
 
             let (importance_map, ..) = importance_map.into_contiguous_buf();
 
-            quant_queue.send(DiffMessage {
+            diffs.send(DiffMessage {
                 importance_map,
                 ordinal_frame_number,
                 image,
                 pts, frame_duration: last_frame_duration.value().max(1. / 100.),
-            })?;
+            }).await?;
         }
 
         Ok(())
     }
 
-    fn quantize_frames(inputs: Receiver<DiffMessage>, remap_queue: OrdQueue<RemapMessage>, settings: &SettingsExt) -> CatResult<()> {
-        minipool::new_channel(settings.max_threads.min(3.try_into().unwrap()), "quant", move |to_remap| {
-        let mut inputs = inputs.into_iter().peekable();
-
-        let DiffMessage {image: first_frame, ..} = inputs.peek().ok_or(Error::NoFrames)?;
-        let first_frame_has_transparency = first_frame.pixels().any(|px| px.a < 128);
+    async fn select_disposal(inputs: Receiver<DiffMessage>, to_quantize: Sender<QuantizeMessage>, settings: &SettingsExt) -> CatResult<()> {
+        let first_frame = inputs.recv().await.map_err(|_| Error::NoFrames)?;
+        let first_frame_has_transparency = first_frame.image.pixels().any(|px| px.a < 128);
 
         let mut prev_frame_keeps = false;
-        let mut consecutive_frame_num = 0;
+        let mut frame_index = 0;
         let mut importance_map = None;
-        while let Some(DiffMessage { mut image, pts, frame_duration, ordinal_frame_number, importance_map: new_importance_map }) = inputs.next() {
+        let mut next_frame = Some(first_frame);
+        while let Some(DiffMessage { mut image, pts, frame_duration, ordinal_frame_number, importance_map: new_importance_map }) = next_frame {
+            next_frame = inputs.recv().await.ok();
 
             if importance_map.is_none() {
                 importance_map = Some(new_importance_map);
             }
 
-            let dispose = if let Some(DiffMessage { image: next_image, .. }) = inputs.peek() {
+            let dispose = if let Some(DiffMessage { image: next_image, .. }) = &next_frame {
                 // Skip identical frames
                 if next_image.as_ref() == image.as_ref() {
                     // this keeps importance_map of the previous frame in the identical-frame series
@@ -651,53 +658,59 @@ impl Writer {
                     // if denoiser says the background didn't change, then believe it
                     // (except higher quality settings, which try to improve it every time)
                     let bg_keep_likelihood = u32::from(settings.s.quality.saturating_sub(80) / 4);
-                    if settings.s.fast || (settings.s.quality < 100 && (consecutive_frame_num % 5) >= bg_keep_likelihood) {
+                    if settings.s.fast || (settings.s.quality < 100 && (frame_index % 5) >= bg_keep_likelihood) {
                         image.pixels_mut().zip(&importance_map).filter(|&(_, &m)| m == 0).for_each(|(px, _)| *px = RGBA8::new(0,0,0,0));
                     }
                 }
 
-                let end_pts = if let Some(&DiffMessage { pts: next_pts, .. }) = inputs.peek() {
+                let end_pts = if let Some(DiffMessage { pts: next_pts, .. }) = next_frame {
                     next_pts
                 } else {
                     pts + frame_duration
                 };
                 debug_assert!(end_pts > 0.);
 
-                to_remap.send((end_pts, image, importance_map, ordinal_frame_number, consecutive_frame_num, dispose, first_frame_has_transparency, prev_frame_keeps))?;
+                let needs_transparency = frame_index > 0 || (frame_index == 0 && first_frame_has_transparency);
+                to_quantize.send(QuantizeMessage {
+                    end_pts, image, importance_map, ordinal_frame_number, frame_index, dispose, needs_transparency, prev_frame_keeps
+                }).await?;
 
-                consecutive_frame_num += 1;
+                frame_index += 1;
                 prev_frame_keeps = dispose == gif::DisposalMethod::Keep;
             }
         }
         Ok(())
-        }, move |(end_pts, image, mut importance_map, ordinal_frame_number, consecutive_frame_num, dispose, first_frame_has_transparency, prev_frame_keeps)| {
-            let needs_transparency = consecutive_frame_num > 0 || (consecutive_frame_num == 0 && first_frame_has_transparency);
-            let (liq, remap, liq_image) = Self::quantize(image, &importance_map, consecutive_frame_num == 0, needs_transparency, prev_frame_keeps, settings).unwrap();
+    }
+
+    async fn quantize_frames_par(inputs: Receiver<QuantizeMessage>, remap_queue: OrdQueue<RemapMessage>, settings: &SettingsExt) -> CatResult<()> {
+        while let Ok(QuantizeMessage { end_pts, image, mut importance_map, ordinal_frame_number, frame_index, dispose, needs_transparency, prev_frame_keeps }) = inputs.recv().await {
+            let (liq, remap, liq_image) = Self::quantize(image, &importance_map, frame_index == 0, needs_transparency, prev_frame_keeps, settings).unwrap();
             let max_loss = settings.gifsicle_loss();
             for imp in &mut importance_map {
                 // encoding assumes rgba background looks like encoded background, which is not true for lossy
                 *imp = ((256 - u32::from(*imp)) * max_loss / 256).min(255) as u8;
             }
 
-            remap_queue.push(consecutive_frame_num as usize, RemapMessage {
+            remap_queue.push(frame_index as usize, RemapMessage {
                 ordinal_frame_number,
                 end_pts,
                 dispose,
                 liq, remap,
                 liq_image,
-            })
-        })
+            }).await?;
+        }
+        Ok(())
     }
 
-    fn remap_frames(mut inputs: OrdQueueIter<RemapMessage>, write_queue: Sender<FrameMessage>, settings: &Settings) -> CatResult<()> {
+    async fn remap_frames(mut inputs: OrdQueueIter<RemapMessage>, write_queue: Sender<FrameMessage>, settings: &Settings) -> CatResult<()> {
 
-        let first_frame = inputs.next().ok_or(Error::NoFrames)?;
+        let first_frame = inputs.next().await.ok_or(Error::NoFrames)?;
         let mut screen = gif_dispose::Screen::new(first_frame.liq_image.width(), first_frame.liq_image.height(), RGBA8::new(0, 0, 0, 0), None);
 
         let mut is_first_frame = true;
         let mut next_frame = Some(first_frame);
         while let Some(RemapMessage {ordinal_frame_number, end_pts, dispose, liq, remap, liq_image}) = next_frame {
-            next_frame = inputs.next();
+            next_frame = inputs.next().await;
             let screen_width = screen.pixels.width() as u16;
             let screen_height = screen.pixels.height() as u16;
             let mut screen_after_dispose = screen.dispose();
@@ -734,7 +747,7 @@ impl Writer {
                     transparent_index,
                     dispose,
                 },
-            })?;
+            }).await?;
 
             is_first_frame = false;
         }
@@ -763,19 +776,6 @@ fn transparent_index_from_palette(image8_pal: &mut [RGBA<u8>], mut image8: ImgRe
     }));
 
     transparent_index
-}
-
-/// When one thread unexpectedly fails, all other threads fail with Aborted, but that Aborted isn't the relevant cause
-#[inline]
-fn combine_res(res1: Result<(), Error>, res2: Result<(), Error>) -> Result<(), Error> {
-    use Error::*;
-    match (res1, res2) {
-        (Err(e), Ok(())) | (Ok(()), Err(e)) => Err(e),
-        (Err(ThreadSend), res) | (res, Err(ThreadSend)) => res,
-        (Err(Aborted), res) | (res, Err(Aborted)) => res,
-        (Err(NoFrames), res) | (res, Err(NoFrames)) => res,
-        (_, res2) => res2,
-    }
 }
 
 fn trim_image(mut image8: ImgVec<u8>, image8_pal: &[RGBA8], transparent_index: Option<u8>, mut screen: ImgRef<RGBA8>) -> Option<(u16, u16, ImgVec<u8>)> {
