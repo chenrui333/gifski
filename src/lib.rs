@@ -689,13 +689,15 @@ impl Writer {
         })
     }
 
-    fn remap_frames(inputs: OrdQueueIter<RemapMessage>, write_queue: Sender<FrameMessage>, settings: &Settings) -> CatResult<()> {
-        let mut inputs = inputs.into_iter().peekable();
-        let first_frame = inputs.peek().ok_or(Error::NoFrames)?;
+    fn remap_frames(mut inputs: OrdQueueIter<RemapMessage>, write_queue: Sender<FrameMessage>, settings: &Settings) -> CatResult<()> {
+
+        let first_frame = inputs.next().ok_or(Error::NoFrames)?;
         let mut screen = gif_dispose::Screen::new(first_frame.liq_image.width(), first_frame.liq_image.height(), RGBA8::new(0, 0, 0, 0), None);
 
         let mut is_first_frame = true;
-        while let Some(RemapMessage {ordinal_frame_number, end_pts, dispose, liq, remap, liq_image}) = inputs.next() {
+        let mut next_frame = Some(first_frame);
+        while let Some(RemapMessage {ordinal_frame_number, end_pts, dispose, liq, remap, liq_image}) = next_frame {
+            next_frame = inputs.next();
             let screen_width = screen.pixels.width() as u16;
             let screen_height = screen.pixels.height() as u16;
             let mut screen_after_dispose = screen.dispose();
@@ -707,7 +709,6 @@ impl Writer {
 
             let transparent_index = transparent_index_from_palette(&mut image8_pal, image8.as_mut());
 
-            let next_frame = inputs.peek();
             let (left, top, image8) = if !is_first_frame && next_frame.is_some() {
                 match trim_image(image8, &image8_pal, transparent_index, screen_after_dispose.pixels()) {
                     Some(trimmed) => trimmed,
